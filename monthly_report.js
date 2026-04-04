@@ -525,29 +525,27 @@ async function runJob() {
     const venueDetails = await fetchVenueDetails();
 
     for (const venue of venueDetails) {
-        if (venue.id === "EpPEDwMbrODVupcyhohe") {
-            const bookings = await fetchBookings(venue.id);
+        //if (venue.id === "EpPEDwMbrODVupcyhohe") {
+        const bookings = await fetchBookings(venue.id);
 
-            if (bookings.length > 0) {
-                const wb = new ExcelJS.Workbook();
+        if (bookings.length > 0) {
+            const wb = new ExcelJS.Workbook();
 
-                createBookingSheet(wb, "Booking Details", bookings);
+            createBookingSheet(wb, "Booking Details", bookings);
 
-                const onlineBookings = bookings.filter(
-                    b => (b.booking_type || "").toUpperCase() === "ONLINE"
-                );
-                createOnlineBookingSheet(wb, "Online Booking", onlineBookings, venue.commission_percentage);
+            const onlineBookings = bookings.filter(
+                b => (b.booking_type || "").toUpperCase() === "ONLINE"
+            );
+            createOnlineBookingSheet(wb, "Online Booking", onlineBookings, venue.commission_percentage);
 
-                createPaymentSheet(wb, "Payment Details", bookings);
+            createPaymentSheet(wb, "Payment Details", bookings);
 
-                await wb.xlsx.writeFile(`${StatementType}Statement.xlsx`);
+            await wb.xlsx.writeFile(`${StatementType}Statement.xlsx`);
 
-                await sendEmail(venue.name, 'abdras157@gmail.com');
-                //await sendEmail(venue.name, venue.email_address);
-
-            }
+            //await sendEmail(venue.name, 'abdras157@gmail.com');
+            await sendEmail(venue.name, venue.email_address);
         }
-
+        //}
     }
 }
 
