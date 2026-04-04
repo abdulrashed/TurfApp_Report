@@ -1,0 +1,32 @@
+name: Monthly Report
+
+on:
+  schedule:
+    # Runs at 00:00 UTC on the 2nd day of every month
+    - cron: '0 0 2 * *'
+  workflow_dispatch: # allows manual triggering for testing
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Setup .env
+        run: |
+          echo "EMAIL_USER=${{ secrets.EMAIL_USER }}" >> .env
+          echo "EMAIL_PASS=${{ secrets.EMAIL_PASS }}" >> .env
+          echo "FIREBASE_SERVICE_ACCOUNT=${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" >> .env
+
+      - name: Run report
+        run: node monthly_report.js
