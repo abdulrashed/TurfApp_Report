@@ -1,7 +1,11 @@
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 const ExcelJS = require("exceljs");
-const serviceAccount = require("./serviceAccountKey.json");
+require('dotenv').config();
+
+const serviceAccount = JSON.parse(
+    Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf-8')
+);
 
 // Initialize Firebase
 admin.initializeApp({
@@ -444,13 +448,13 @@ async function sendEmail(venueName, toEmail) {
     let transporter = nodemailer.createTransport({
         service: "gmail",
         auth: {
-            user: "gameon.bookyourslot@gmail.com",
-            pass: "sygnehrumxasrmrs"
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASS
         }
     });
 
     await transporter.sendMail({
-        from: "gameon.bookyourslot@gmail.com",
+        from: process.env.EMAIL_USER,
         to: toEmail,
         bcc: "rahmanvapu@gmail.com, abdras157@gmail.com",
         subject: `${venueName} - ${StatementType} Statement - ${start} to ${end}`,

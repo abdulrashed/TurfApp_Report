@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "dotenv": "^17.4.0",
     "exceljs": "^4.4.0",
     "firebase-admin": "^13.7.0",
     "nodemailer": "^8.0.1"
