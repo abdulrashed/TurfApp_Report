@@ -3,16 +3,9 @@ const nodemailer = require("nodemailer");
 const ExcelJS = require("exceljs");
 require('dotenv').config();
 
-const serviceAccount = JSON.parse(
-    Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf-8')
-);
-
-// Initialize Firebase
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-});
-
-const db = admin.firestore();
+// Firebase is initialized lazily in the direct-run guard at the bottom so this
+// module can be imported (e.g. by tests) without service-account credentials.
+let db;
 
 const StatementType = "Monthly"; // Change to "Weekly" for weekly statements
 
@@ -93,23 +86,39 @@ function calculateDuration(startTime, endTime) {
     if (hours === 1) return "1 Hour";
     return hours + " Hours";
 }
+// A cancelled booking whose online payment was credited back to the customer's
+// GameOn Wallet. Its money must be excluded from report revenue.
+function isRefundedToWallet(b) {
+    const isCancelled = (b.status || "").toLowerCase() === "cancelled";
+    if (!isCancelled) return false;
+    return (
+        b.wallet_refund_choice === "refund_to_gameon_wallet" ||
+        Number(b.wallet_refund_amount || 0) > 0
+    );
+}
 function splitPayments(payments = []) {
     let razorpay = 0,
         cash = 0,
         upi = 0,
-        card = 0;
+        card = 0,
+        wallet = 0;
 
     payments.forEach(p => {
         const amount = Number(p.amount || 0);
         const method = (p.method || "").toLowerCase();
 
-        if (method.includes("razor")) razorpay += amount;
+        // "Online" is the customer-facing label for gateway (Razorpay) card
+        // payments; older records may still carry "razorpay".
+        if (method.includes("razor") || method === "online") razorpay += amount;
         else if (method === "cash") cash += amount;
         else if (method === "upi") upi += amount;
         else if (method === "card") card += amount;
+        // GameOn Wallet is an online payment method; keep it in its own bucket
+        // so it counts toward Total Paid without being mislabelled as Razorpay.
+        else if (method.includes("wallet")) wallet += amount;
     });
 
-    return { razorpay, cash, upi, card };
+    return { razorpay, cash, upi, card, wallet };
 }
 function createBookingSheet(wb, sheetName, bookings) {
     const ws = wb.addWorksheet(sheetName);
@@ -119,7 +128,7 @@ function createBookingSheet(wb, sheetName, bookings) {
         "Venue Name", "Court ID", "Sport", "Start Time", "End Time",
         "Duration", "Slot Cost", "Final Amount",
         "Coupon Code", "Coupon Discount",
-        "Razorpay", "Cash", "UPI", "Card",
+        "Online", "Cash", "UPI", "Card", "GameOn Wallet",
         "Total Paid", "Balance/Due",
         "Customer Name", "Customer Phone", "Country Code"
     ];
@@ -139,15 +148,24 @@ function createBookingSheet(wb, sheetName, bookings) {
         cash: 0,
         upi: 0,
         card: 0,
+        wallet: 0,
         totalPaid: 0,
         balance: 0
     };
 
     bookings.forEach(b => {
         const payments = splitPayments(b.payment || []);
-        const totalPaid = payments.razorpay + payments.cash + payments.upi + payments.card;
 
         const isCancelled = (b.status || "").toLowerCase() === "cancelled";
+        // Online money refunded to the customer's GameOn Wallet is no longer
+        // revenue — drop the Razorpay + Wallet portions so the report matches
+        // the settlement/finance behaviour.
+        if (isRefundedToWallet(b)) {
+            payments.razorpay = 0;
+            payments.wallet = 0;
+        }
+        const totalPaid = payments.razorpay + payments.cash + payments.upi + payments.card + payments.wallet;
+
         const couponDiscount = Number(b.coupon_discount) || 0;
         const finalAmount = isCancelled ? 0 : (Number(b.final_amount) || 0);
         const balance = isCancelled ? 0 : finalAmount - totalPaid;
@@ -159,6 +177,7 @@ function createBookingSheet(wb, sheetName, bookings) {
         totals.cash += payments.cash;
         totals.upi += payments.upi;
         totals.card += payments.card;
+        totals.wallet += payments.wallet;
         totals.totalPaid += totalPaid;
         totals.balance += balance;
 
@@ -181,6 +200,7 @@ function createBookingSheet(wb, sheetName, bookings) {
             payments.cash,
             payments.upi,
             payments.card,
+            payments.wallet,
             totalPaid,
             balance,
             (b.user && b.user.name) ? b.user.name : "",
@@ -189,7 +209,7 @@ function createBookingSheet(wb, sheetName, bookings) {
         ]);
 
         row.getCell(3).numFmt = "yyyy-mm-dd";
-        [11, 12, 14, 15, 16, 17, 18, 19, 20].forEach(i => {
+        [11, 12, 14, 15, 16, 17, 18, 19, 20, 21].forEach(i => {
             row.getCell(i).numFmt = "#,##0.00";
         });
 
@@ -211,6 +231,7 @@ function createBookingSheet(wb, sheetName, bookings) {
         totals.cash,
         totals.upi,
         totals.card,
+        totals.wallet,
         totals.totalPaid,
         totals.balance,
         "", "", ""
@@ -222,7 +243,7 @@ function createBookingSheet(wb, sheetName, bookings) {
         cell.border = { top: { style: "thin" }, bottom: { style: "double" } };
     });
 
-    [11, 12, 14, 15, 16, 17, 18, 19, 20].forEach(i => {
+    [11, 12, 14, 15, 16, 17, 18, 19, 20, 21].forEach(i => {
         totalRow.getCell(i).numFmt = "#,##0.00";
     });
 
@@ -242,7 +263,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         "Venue Name", "Court ID", "Sport", "Start Time", "End Time",
         "Duration", "Slot Cost", "Final Amount",
         "Coupon Code", "Coupon Discount",
-        "Razorpay", "Cash", "UPI", "Card",
+        "Online", "Cash", "UPI", "Card", "GameOn Wallet",
         "Total Paid", "Balance/Due", "Commission Percentage", "Commission Amount",
         "Customer Name", "Customer Phone", "Country Code"
     ];
@@ -262,6 +283,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         cash: 0,
         upi: 0,
         card: 0,
+        wallet: 0,
         totalPaid: 0,
         balance: 0,
         commissionAmount: 0
@@ -269,14 +291,27 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
 
     bookings.forEach(b => {
         const payments = splitPayments(b.payment || []);
-        const totalPaid = payments.razorpay + payments.cash + payments.upi + payments.card;
 
         const isCancelled = (b.status || "").toLowerCase() === "cancelled";
+        // Online money refunded to the customer's GameOn Wallet is no longer
+        // revenue — drop the Razorpay + Wallet portions so the report (and its
+        // commission) matches the settlement/finance behaviour.
+        if (isRefundedToWallet(b)) {
+            payments.razorpay = 0;
+            payments.wallet = 0;
+        }
+        const totalPaid = payments.razorpay + payments.cash + payments.upi + payments.card + payments.wallet;
+
         const couponDiscount = Number(b.coupon_discount) || 0;
         const finalAmount = isCancelled ? 0 : (Number(b.final_amount) || 0);
         const balance = isCancelled ? 0 : finalAmount - totalPaid;
 
-        const commissionAmount = isCancelled ? ((payments.razorpay * commission_percentage) / 100) : ((finalAmount * commission_percentage) / 100);
+        // Commission is charged on the online money received. For active bookings
+        // that is the final amount; for cancelled ones it is whatever was kept
+        // online (Razorpay + GameOn Wallet).
+        const commissionAmount = isCancelled
+            ? (((payments.razorpay + payments.wallet) * commission_percentage) / 100)
+            : ((finalAmount * commission_percentage) / 100);
 
         totals.slotCost += Number(b.slot_cost) || 0;
         totals.finalAmount += finalAmount;
@@ -285,6 +320,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         totals.cash += payments.cash;
         totals.upi += payments.upi;
         totals.card += payments.card;
+        totals.wallet += payments.wallet;
         totals.totalPaid += totalPaid;
         totals.balance += balance;
         totals.commissionAmount += commissionAmount;
@@ -308,6 +344,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
             payments.cash,
             payments.upi,
             payments.card,
+            payments.wallet,
             totalPaid,
             balance,
             commission_percentage,
@@ -318,7 +355,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         ]);
 
         row.getCell(3).numFmt = "yyyy-mm-dd";
-        [11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22].forEach(i => {
+        [11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23].forEach(i => {
             row.getCell(i).numFmt = "#,##0.00";
         });
 
@@ -340,6 +377,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         totals.cash,
         totals.upi,
         totals.card,
+        totals.wallet,
         totals.totalPaid,
         totals.balance,
         "",
@@ -353,7 +391,7 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
         cell.border = { top: { style: "thin" }, bottom: { style: "double" } };
     });
 
-    [11, 12, 14, 15, 16, 17, 18, 19, 20, 22].forEach(i => {
+    [11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 23].forEach(i => {
         totalRow.getCell(i).numFmt = "#,##0.00";
     });
 
@@ -549,4 +587,24 @@ async function runJob() {
     }
 }
 
-runJob();
+// Only initialize Firebase and run the job when executed directly
+// (`node monthly_report.js`). When required as a module, the pure sheet-building
+// helpers below are exported for testing without any credentials.
+if (require.main === module) {
+    const serviceAccount = JSON.parse(
+        Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf-8')
+    );
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    db = admin.firestore();
+    runJob();
+}
+
+module.exports = {
+    splitPayments,
+    isRefundedToWallet,
+    createBookingSheet,
+    createOnlineBookingSheet,
+    createPaymentSheet,
+};
