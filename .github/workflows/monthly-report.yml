@@ -4,7 +4,16 @@ on:
   schedule:
     # Runs at 00:00 UTC on the 2nd day of every month
     - cron: '0 0 2 * *'
-  workflow_dispatch: # allows manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      venue_name:
+        description: Exact active venue name (leave blank for all venues)
+        required: false
+        type: string
+      recipient_email:
+        description: Test recipient override (must be used with venue name)
+        required: false
+        type: string
 
 permissions:
   # Scheduled workflows in inactive public repositories are automatically
@@ -41,6 +50,9 @@ jobs:
 
       - name: Run report
         run: node monthly_report.js
+        env:
+          REPORT_VENUE_NAME: ${{ inputs.venue_name }}
+          REPORT_EMAIL_OVERRIDE: ${{ inputs.recipient_email }}
 
       - name: Record successful scheduled delivery
         if: github.event_name == 'schedule'
