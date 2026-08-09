@@ -139,6 +139,10 @@ function getRecognizedPayments(booking) {
     }
     return payments;
 }
+function isOnlinePaymentMethod(method) {
+    const normalized = String(method || "").trim().toLowerCase();
+    return normalized.includes("razor") || normalized === "online" || normalized.includes("wallet");
+}
 function styleHeader(row) {
     row.eachCell(cell => {
         cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
@@ -168,6 +172,133 @@ function autoFitColumns(ws, minimumWidth = 10) {
             to: { row: 1, column: ws.columnCount },
         };
     }
+}
+function addPaymentSplits(target, source) {
+    target.razorpay += source.razorpay;
+    target.cash += source.cash;
+    target.upi += source.upi;
+    target.card += source.card;
+    target.wallet += source.wallet;
+    return target;
+}
+function calculateAnalyticsSummary(bookings, productSales = []) {
+    const realBookings = bookings.filter(booking => !booking.is_dummy);
+    const validBookings = realBookings.filter(
+        booking => (booking.status || "").toLowerCase() !== "cancelled"
+    );
+    const validProductSales = productSales.filter(
+        sale => (sale.payment_status || "").toLowerCase() !== "cancelled"
+    );
+
+    const slotRevenue = validBookings
+        .filter(booking => booking.type !== "membership")
+        .reduce((sum, booking) => sum + (Number(booking.final_amount) || 0), 0);
+    const bookingProductRevenue = validBookings
+        .filter(booking => booking.type !== "membership")
+        .reduce((sum, booking) => sum + getBookingProductAmount(booking), 0);
+    const standaloneProductRevenue = validProductSales.reduce(
+        (sum, sale) => sum + (Number(sale.total_amount) || 0),
+        0
+    );
+    const membershipRevenue = validBookings
+        .filter(booking => booking.type === "membership")
+        .reduce((sum, booking) => sum + (Number(booking.final_amount) || 0), 0);
+    const retainedCancelledRevenue = realBookings
+        .filter(booking => (booking.status || "").toLowerCase() === "cancelled")
+        .reduce((sum, booking) => sum + totalPayments(getRecognizedPayments(booking)), 0);
+    const productRevenue = bookingProductRevenue + standaloneProductRevenue;
+    const totalRevenue = slotRevenue + membershipRevenue + retainedCancelledRevenue;
+    const totalBusinessRevenue = totalRevenue + productRevenue;
+
+    const payments = { razorpay: 0, cash: 0, upi: 0, card: 0, wallet: 0, unclassified: 0 };
+    realBookings.forEach(booking => {
+        addPaymentSplits(payments, getRecognizedPayments(booking));
+        if (
+            booking.type === "membership" &&
+            booking.is_legacy_membership_row &&
+            (!Array.isArray(booking.payment) || booking.payment.length === 0)
+        ) {
+            payments.unclassified += Number(booking.paid_amount) || 0;
+        }
+    });
+    validProductSales.forEach(sale => {
+        addPaymentSplits(payments, splitPayments(sale.payment || []));
+    });
+
+    const bookingDue = validBookings.reduce((sum, booking) => {
+        const charge = (Number(booking.final_amount) || 0) +
+            (booking.type === "membership" ? 0 : getBookingProductAmount(booking));
+        return sum + Math.max(charge - totalPayments(getRecognizedPayments(booking)), 0);
+    }, 0);
+    const standaloneProductDue = validProductSales.reduce((sum, sale) => {
+        const paid = totalPayments(splitPayments(sale.payment || []));
+        return sum + Math.max((Number(sale.total_amount) || 0) - paid, 0);
+    }, 0);
+
+    return {
+        totalBusinessRevenue,
+        totalRevenue,
+        slotRevenue,
+        productRevenue,
+        bookingProductRevenue,
+        standaloneProductRevenue,
+        membershipRevenue,
+        retainedCancelledRevenue,
+        payments,
+        totalRecognizedPayments: totalPayments(payments) + payments.unclassified,
+        pendingAmount: bookingDue + standaloneProductDue,
+        totalBookings: realBookings.length,
+        cancelledBookings: realBookings.filter(
+            booking => (booking.status || "").toLowerCase() === "cancelled"
+        ).length,
+        blockedBookings: realBookings.filter(
+            booking => (booking.status || "").toLowerCase() === "blocked"
+        ).length,
+        couponDiscount: validBookings.reduce(
+            (sum, booking) => sum + (Number(booking.coupon_discount) || 0),
+            0
+        ),
+        coinDiscount: validBookings.reduce(
+            (sum, booking) => sum + (Number(booking.coin_discount) || 0),
+            0
+        ),
+    };
+}
+function createAnalyticsSummarySheet(wb, sheetName, bookings, productSales = []) {
+    const ws = wb.addWorksheet(sheetName);
+    const summary = calculateAnalyticsSummary(bookings, productSales);
+    styleHeader(ws.addRow(["Metric", "Amount / Count", "Definition"]));
+
+    const rows = [
+        ["Total Business Revenue", summary.totalBusinessRevenue, "Slot + products + memberships + retained cancelled booking payments"],
+        ["Total Revenue", summary.totalRevenue, "Booking and membership revenue, plus retained cancelled booking payments"],
+        ["Slot Revenue", summary.slotRevenue, "Final slot amount from non-cancelled, non-membership bookings"],
+        ["Product Revenue", summary.productRevenue, "Booking product sales + standalone product sales"],
+        ["Booking Product Revenue", summary.bookingProductRevenue, "Product charges attached to non-cancelled bookings"],
+        ["Standalone Product Revenue", summary.standaloneProductRevenue, "Non-cancelled standalone product sales"],
+        ["Membership Revenue", summary.membershipRevenue, "Final membership amount allocated to service dates in this month"],
+        ["Retained Cancelled Revenue", summary.retainedCancelledRevenue, "Cancelled booking payments retained as revenue; wallet refunds excluded"],
+        ["Online Payment", summary.payments.razorpay, "Recognized Online/Razorpay payments, including product sales"],
+        ["Cash Payment", summary.payments.cash, "Recognized cash payments, including product sales"],
+        ["UPI Payment", summary.payments.upi, "Recognized UPI payments, including product sales"],
+        ["Card Payment", summary.payments.card, "Recognized card payments, including product sales"],
+        ["GameOn Wallet Payment", summary.payments.wallet, "Recognized GameOn Wallet payments"],
+        ["Legacy / Unclassified Payment", summary.payments.unclassified, "Allocated legacy paid amount without a stored payment method"],
+        ["Total Recognized Payments", summary.totalRecognizedPayments, "Analytics amount from Payment Details"],
+        ["Pending Amount", summary.pendingAmount, "Remaining booking, membership, and standalone product-sale due"],
+        ["Coupon Discount", summary.couponDiscount, "Coupon discounts on non-cancelled bookings"],
+        ["Coin Discount", summary.coinDiscount, "Coin discounts on non-cancelled bookings"],
+        ["Total Bookings", summary.totalBookings, "Dated bookings plus allocated legacy membership dates"],
+        ["Cancelled Bookings", summary.cancelledBookings, "Cancelled booking rows"],
+        ["Blocked Bookings", summary.blockedBookings, "Blocked booking rows"],
+    ];
+
+    rows.forEach((values, index) => {
+        const row = ws.addRow(values);
+        row.getCell(2).numFmt = index >= 18 ? "#,##0" : "#,##0.00";
+    });
+    ws.getColumn(1).font = { bold: true };
+    autoFitColumns(ws, 16);
 }
 function createBookingSheet(wb, sheetName, bookings) {
     const ws = wb.addWorksheet(sheetName);
@@ -418,40 +549,111 @@ function createOnlineBookingSheet(wb, sheetName, bookings, commission_percentage
 
     autoFitColumns(ws);
 }
-function createPaymentSheet(wb, sheetName, bookings) {
+function createPaymentSheet(wb, sheetName, bookings, standaloneSales = []) {
     const ps = wb.addWorksheet(sheetName);
 
     const payHeader = ps.addRow([
-        "Booking ID", "Booking Type", "Booking Date", "Booking Status", "Payment Method",
-        "Amount", "Collected By", "Datetime"
+        "Payment Source", "Reference ID", "Date", "Status", "Payment Method",
+        "Recorded Amount", "Analytics Amount", "Collected By", "Datetime", "Notes"
     ]);
 
     styleHeader(payHeader);
 
     let paymentTotals = {
-        amount: 0,
+        recordedAmount: 0,
+        analyticsAmount: 0,
     };
 
     bookings.forEach(b => {
         (b.payment || []).forEach(p => {
-
             const isCancelled = (b.status || "").toLowerCase() === "cancelled";
+            const amount = Number(p.amount) || 0;
+            const returnedToWallet = isRefundedToWallet(b) && isOnlinePaymentMethod(p.method);
+            const analyticsAmount = returnedToWallet ? 0 : amount;
+            const hasProducts = b.type !== "membership" && getBookingProductAmount(b) > 0;
+            const source = b.type === "membership"
+                ? "Membership"
+                : hasProducts
+                    ? "Booking + Products"
+                    : "Booking";
+            const notes = returnedToWallet
+                ? "Returned to GameOn Wallet; excluded from analytics revenue"
+                : hasProducts
+                    ? "Payment covers booking slot and product charges"
+                    : b.is_legacy_membership_row
+                        ? "Legacy membership payment allocated to this date"
+                        : "";
 
-            paymentTotals.amount += Number(p.amount) || 0;
+            paymentTotals.recordedAmount += amount;
+            paymentTotals.analyticsAmount += analyticsAmount;
 
             const row = ps.addRow([
-                b.id,
-                b.booking_type,
+                source,
+                b.report_membership_id || b.id,
                 b.date,
                 b.status,
                 p.method || "",
-                Number(p.amount) || 0,
+                amount,
+                analyticsAmount,
                 p.paid_user_name || "",
-                p.datetime || p.payment_datetime || ""
+                p.datetime || p.payment_datetime || "",
+                notes,
             ]);
 
-            row.getCell(6).numFmt = "#,##0.00";
+            [6, 7].forEach(index => {
+                row.getCell(index).numFmt = "#,##0.00";
+            });
 
+            if (isCancelled) {
+                row.eachCell(cell => {
+                    cell.font = { color: { argb: "FF888888" } };
+                });
+            }
+        });
+
+        if (
+            b.type === "membership" &&
+            b.is_legacy_membership_row &&
+            (!Array.isArray(b.payment) || b.payment.length === 0) &&
+            Number(b.paid_amount) > 0
+        ) {
+            const amount = Number(b.paid_amount) || 0;
+            const isCancelled = (b.status || "").toLowerCase() === "cancelled";
+            paymentTotals.recordedAmount += amount;
+            paymentTotals.analyticsAmount += amount;
+            const row = ps.addRow([
+                "Membership", b.report_membership_id || b.id, b.date, b.status,
+                "Legacy / unspecified", amount, amount, "", "",
+                "Legacy membership paid amount allocated to this date",
+            ]);
+            [6, 7].forEach(index => {
+                row.getCell(index).numFmt = "#,##0.00";
+            });
+            if (isCancelled) {
+                row.eachCell(cell => {
+                    cell.font = { color: { argb: "FF888888" } };
+                });
+            }
+        }
+    });
+
+    standaloneSales.forEach(sale => {
+        (sale.payment || []).forEach(payment => {
+            const amount = Number(payment.amount) || 0;
+            const isCancelled = (sale.payment_status || "").toLowerCase() === "cancelled";
+            const analyticsAmount = isCancelled ? 0 : amount;
+            paymentTotals.recordedAmount += amount;
+            paymentTotals.analyticsAmount += analyticsAmount;
+            const row = ps.addRow([
+                "Standalone Product Sale", sale.id, sale.date, sale.payment_status,
+                payment.method || "", amount, analyticsAmount,
+                payment.paid_user_name || sale.created_by?.name || "",
+                payment.datetime || payment.payment_datetime || "",
+                isCancelled ? "Cancelled product sale; excluded from analytics payments" : "",
+            ]);
+            [6, 7].forEach(index => {
+                row.getCell(index).numFmt = "#,##0.00";
+            });
             if (isCancelled) {
                 row.eachCell(cell => {
                     cell.font = { color: { argb: "FF888888" } };
@@ -462,8 +664,9 @@ function createPaymentSheet(wb, sheetName, bookings) {
 
     const paymentTotalRow = ps.addRow([
         "TOTAL", "", "", "", "",
-        paymentTotals.amount,
-        "", ""
+        paymentTotals.recordedAmount,
+        paymentTotals.analyticsAmount,
+        "", "", ""
     ]);
 
     paymentTotalRow.eachCell(cell => {
@@ -472,7 +675,7 @@ function createPaymentSheet(wb, sheetName, bookings) {
         cell.border = { top: { style: "thin" }, bottom: { style: "double" } };
     });
 
-    [6].forEach(i => {
+    [6, 7].forEach(i => {
         paymentTotalRow.getCell(i).numFmt = "#,##0.00";
     });
 
@@ -530,7 +733,12 @@ function createProductSalesSheet(wb, sheetName, bookings, standaloneSales = []) 
 
     const rows = [];
     bookings
-        .filter(booking => !booking.is_dummy && getBookingProductAmount(booking) > 0)
+        .filter(
+            booking =>
+                !booking.is_dummy &&
+                booking.type !== "membership" &&
+                getBookingProductAmount(booking) > 0
+        )
         .forEach(booking => {
             const isCancelled = (booking.status || "").toLowerCase() === "cancelled";
             const productAmount = isCancelled ? 0 : getBookingProductAmount(booking);
@@ -770,14 +978,14 @@ function createMembershipSheet(wb, sheetName, membershipRows) {
     const header = [
         "Membership ID", "Booking Date", "Membership Start", "Membership End",
         "Status", "Venue Name", "Court", "Sport", "Start Time", "End Time",
-        "Allocated Slot Cost", "Allocated Revenue", "Online", "Cash", "UPI",
-        "Card", "GameOn Wallet", "Allocated Paid", "Balance/Due",
+        "Allocated Original Slot Value", "Allocated Membership Revenue", "Allocated Discount",
+        "Online", "Cash", "UPI", "Card", "GameOn Wallet", "Allocated Paid", "Balance/Due",
         "Customer Name", "Customer Phone", "Record Type"
     ];
     styleHeader(ws.addRow(header));
 
     const totals = {
-        slot: 0, revenue: 0, razorpay: 0, cash: 0, upi: 0, card: 0,
+        slot: 0, revenue: 0, discount: 0, razorpay: 0, cash: 0, upi: 0, card: 0,
         wallet: 0, paid: 0, due: 0,
     };
 
@@ -785,6 +993,7 @@ function createMembershipSheet(wb, sheetName, membershipRows) {
         const isCancelled = (membership.status || "").toLowerCase() === "cancelled";
         const slotAmount = isCancelled ? 0 : (Number(membership.slot_cost) || 0);
         const revenue = isCancelled ? 0 : (Number(membership.final_amount) || 0);
+        const discount = Math.max(slotAmount - revenue, 0);
         const payments = splitPayments(membership.payment || []);
         const paid = payments.razorpay || payments.cash || payments.upi || payments.card || payments.wallet
             ? totalPayments(payments)
@@ -793,6 +1002,7 @@ function createMembershipSheet(wb, sheetName, membershipRows) {
 
         totals.slot += slotAmount;
         totals.revenue += revenue;
+        totals.discount += discount;
         totals.razorpay += payments.razorpay;
         totals.cash += payments.cash;
         totals.upi += payments.upi;
@@ -807,12 +1017,12 @@ function createMembershipSheet(wb, sheetName, membershipRows) {
             membership.status, membership.venue_name,
             membership.court_name || membership.court_id,
             membership.sport?.name || "", membership.start_time, membership.end_time,
-            slotAmount, revenue, payments.razorpay, payments.cash, payments.upi,
+            slotAmount, revenue, discount, payments.razorpay, payments.cash, payments.upi,
             payments.card, payments.wallet, paid, due,
             membership.user?.name || "", membership.user?.phone || "",
             membership.is_legacy_membership_row ? "Legacy allocated" : "Per-date booking",
         ]);
-        [11, 12, 13, 14, 15, 16, 17, 18, 19].forEach(index => {
+        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20].forEach(index => {
             row.getCell(index).numFmt = "#,##0.00";
         });
         if (isCancelled) {
@@ -824,11 +1034,11 @@ function createMembershipSheet(wb, sheetName, membershipRows) {
 
     const totalRow = ws.addRow([
         "TOTAL", "", "", "", "", "", "", "", "", "",
-        totals.slot, totals.revenue, totals.razorpay, totals.cash, totals.upi,
+        totals.slot, totals.revenue, totals.discount, totals.razorpay, totals.cash, totals.upi,
         totals.card, totals.wallet, totals.paid, totals.due, "", "", "",
     ]);
     styleTotalRow(totalRow);
-    [11, 12, 13, 14, 15, 16, 17, 18, 19].forEach(index => {
+    [11, 12, 13, 14, 15, 16, 17, 18, 19, 20].forEach(index => {
         totalRow.getCell(index).numFmt = "#,##0.00";
     });
     autoFitColumns(ws, 12);
@@ -852,6 +1062,7 @@ async function sendEmail(venueName, toEmail, start, end) {
         Please find attached the ${StatementType.toLowerCase()} booking and payment report for your venue.
 
         This report includes:
+        • Analytics summary
         • Booking details
         • Online bookings
         • Product sales
@@ -968,13 +1179,26 @@ async function runJob() {
             range.start,
             range.end
         );
+        const legacyMembershipRows = membershipRows.filter(
+            membership => membership.is_legacy_membership_row
+        );
+        // This mirrors the Analytics screen, which combines dated bookings with
+        // date-allocated legacy memberships. New membership child bookings are
+        // already present in reportBookings and are not added twice.
+        const analyticsBookings = [...reportBookings, ...legacyMembershipRows];
 
         if (reportBookings.length > 0 || productSales.length > 0 || membershipRows.length > 0) {
             const wb = new ExcelJS.Workbook();
 
-            createBookingSheet(wb, "Booking Details", reportBookings);
+            createAnalyticsSummarySheet(
+                wb,
+                "Analytics Summary",
+                analyticsBookings,
+                productSales
+            );
+            createBookingSheet(wb, "Booking Details", analyticsBookings);
 
-            const onlineBookings = reportBookings.filter(
+            const onlineBookings = analyticsBookings.filter(
                 b => (b.booking_type || "").toUpperCase() === "ONLINE"
             );
             createOnlineBookingSheet(wb, "Online Booking", onlineBookings, venue.commission_percentage);
@@ -982,14 +1206,19 @@ async function runJob() {
             createProductSalesSheet(
                 wb,
                 "Product Sales",
-                reportBookings,
+                analyticsBookings,
                 productSales.map(sale => ({
                     ...sale,
                     venue_name: sale.venue_name || venue.name,
                 }))
             );
             createMembershipSheet(wb, "Memberships", membershipRows);
-            createPaymentSheet(wb, "Payment Details", reportBookings);
+            createPaymentSheet(
+                wb,
+                "Payment Details",
+                analyticsBookings,
+                productSales
+            );
 
             await wb.xlsx.writeFile(`${StatementType}Statement.xlsx`);
 
@@ -1025,6 +1254,8 @@ if (require.main === module) {
 module.exports = {
     allocateBookingProductPayments,
     buildMembershipReportRows,
+    calculateAnalyticsSummary,
+    createAnalyticsSummarySheet,
     createBookingSheet,
     createMembershipSheet,
     createOnlineBookingSheet,
