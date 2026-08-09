@@ -1142,6 +1142,43 @@ async function fetchMemberships(venueId) {
     return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 }
 
+function isIsoDate(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+async function cleanupBlockConcurrentThrough(cutoffDate, firestore = db) {
+    if (!isIsoDate(cutoffDate)) {
+        throw new Error(`Invalid block_concurrent cleanup cutoff: ${cutoffDate}`);
+    }
+    if (!firestore) {
+        throw new Error("Firestore must be initialized before block_concurrent cleanup.");
+    }
+
+    // Keep each commit below Firestore's 500-write batch limit. Re-querying
+    // after every commit also avoids loading an unbounded historical collection.
+    const batchSize = 450;
+    let deletedCount = 0;
+
+    while (true) {
+        const snapshot = await firestore
+            .collection("block_concurrent")
+            .where("date", "<=", cutoffDate)
+            .limit(batchSize)
+            .get();
+
+        if (snapshot.empty) break;
+
+        const batch = firestore.batch();
+        snapshot.docs.forEach(docSnapshot => batch.delete(docSnapshot.ref));
+        await batch.commit();
+        deletedCount += snapshot.size;
+    }
+
+    return deletedCount;
+}
+
 
 async function runJob() {
     const range = StatementType === "Monthly"
@@ -1153,6 +1190,13 @@ async function runJob() {
     if (Boolean(venueFilter) !== Boolean(emailOverride)) {
         throw new Error(
             "REPORT_VENUE_NAME and REPORT_EMAIL_OVERRIDE must be provided together."
+        );
+    }
+
+    if (StatementType === "Monthly") {
+        const deletedCount = await cleanupBlockConcurrentThrough(range.end);
+        console.log(
+            `Deleted ${deletedCount} block_concurrent document(s) dated ${range.end} or earlier.`
         );
     }
 
@@ -1261,6 +1305,7 @@ module.exports = {
     createOnlineBookingSheet,
     createPaymentSheet,
     createProductSalesSheet,
+    cleanupBlockConcurrentThrough,
     getBookingProductAmount,
     splitPayments,
     isRefundedToWallet,

@@ -5,6 +5,7 @@ const ExcelJS = require("exceljs");
 const {
     buildMembershipReportRows,
     calculateAnalyticsSummary,
+    cleanupBlockConcurrentThrough,
     createBookingSheet,
     createMembershipSheet,
     createOnlineBookingSheet,
@@ -13,6 +14,54 @@ const {
     isRefundedToWallet,
     splitPayments,
 } = require("./monthly_report");
+
+const createCleanupFirestore = (pages) => {
+    const cutoffs = [];
+    const limits = [];
+    const deletedRefs = [];
+    let pageIndex = 0;
+
+    const firestore = {
+        collection(name) {
+            assert.equal(name, "block_concurrent");
+            return {
+                where(field, operator, cutoff) {
+                    assert.equal(field, "date");
+                    assert.equal(operator, "<=");
+                    cutoffs.push(cutoff);
+                    return {
+                        limit(value) {
+                            limits.push(value);
+                            return {
+                                async get() {
+                                    const refs = pages[pageIndex++] || [];
+                                    return {
+                                        docs: refs.map(ref => ({ ref })),
+                                        empty: refs.length === 0,
+                                        size: refs.length,
+                                    };
+                                },
+                            };
+                        },
+                    };
+                },
+            };
+        },
+        batch() {
+            const refs = [];
+            return {
+                delete(ref) {
+                    refs.push(ref);
+                },
+                async commit() {
+                    deletedRefs.push(...refs);
+                },
+            };
+        },
+    };
+
+    return { firestore, cutoffs, limits, deletedRefs };
+};
 
 const onlineBooking = (overrides = {}) => ({
     id: "booking-1",
@@ -43,6 +92,31 @@ test("recognizes current online and GameOn Wallet payment labels", () => {
             { method: "Cash", amount: 400 },
         ]),
         { razorpay: 300, cash: 400, upi: 0, card: 0, wallet: 300 },
+    );
+});
+
+test("deletes block_concurrent documents through the previous month in safe batches", async () => {
+    const mock = createCleanupFirestore([
+        ["block-1", "block-2"],
+        ["block-3"],
+        [],
+    ]);
+
+    const deletedCount = await cleanupBlockConcurrentThrough(
+        "2026-07-31",
+        mock.firestore,
+    );
+
+    assert.equal(deletedCount, 3);
+    assert.deepEqual(mock.deletedRefs, ["block-1", "block-2", "block-3"]);
+    assert.deepEqual(mock.cutoffs, ["2026-07-31", "2026-07-31", "2026-07-31"]);
+    assert.deepEqual(mock.limits, [450, 450, 450]);
+});
+
+test("rejects an invalid block_concurrent cleanup cutoff", async () => {
+    await assert.rejects(
+        cleanupBlockConcurrentThrough("2026-07-32", {}),
+        /Invalid block_concurrent cleanup cutoff/,
     );
 });
 
