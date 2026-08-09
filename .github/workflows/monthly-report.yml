@@ -7,7 +7,10 @@ on:
   workflow_dispatch: # allows manual triggering for testing
 
 permissions:
-  contents: read
+  # Scheduled workflows in inactive public repositories are automatically
+  # disabled. The final scheduled-only step records a successful run so this
+  # monthly workflow remains active and leaves a delivery audit trail.
+  contents: write
 
 jobs:
   send-report:
@@ -16,10 +19,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -38,3 +41,13 @@ jobs:
 
       - name: Run report
         run: node monthly_report.js
+
+      - name: Record successful scheduled delivery
+        if: github.event_name == 'schedule'
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/monthly-report-last-success.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/monthly-report-last-success.txt
+          git commit -m "chore: record monthly report delivery [skip ci]"
+          git push origin HEAD:main
