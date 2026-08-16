@@ -1179,6 +1179,37 @@ async function cleanupBlockConcurrentThrough(cutoffDate, firestore = db) {
     return deletedCount;
 }
 
+async function cleanupWaitlistsThrough(cutoffDate, firestore = db) {
+    if (!isIsoDate(cutoffDate)) {
+        throw new Error(`Invalid slot_waitlists cleanup cutoff: ${cutoffDate}`);
+    }
+    if (!firestore) {
+        throw new Error("Firestore must be initialized before slot_waitlists cleanup.");
+    }
+
+    // Waitlist documents use the requested starting date as an ISO date.
+    // Delete every status through the completed month in safe write batches.
+    const batchSize = 450;
+    let deletedCount = 0;
+
+    while (true) {
+        const snapshot = await firestore
+            .collection("slot_waitlists")
+            .where("date", "<=", cutoffDate)
+            .limit(batchSize)
+            .get();
+
+        if (snapshot.empty) break;
+
+        const batch = firestore.batch();
+        snapshot.docs.forEach(docSnapshot => batch.delete(docSnapshot.ref));
+        await batch.commit();
+        deletedCount += snapshot.size;
+    }
+
+    return deletedCount;
+}
+
 
 async function runJob() {
     const range = StatementType === "Monthly"
@@ -1194,9 +1225,15 @@ async function runJob() {
     }
 
     if (StatementType === "Monthly") {
-        const deletedCount = await cleanupBlockConcurrentThrough(range.end);
+        const [deletedBlockCount, deletedWaitlistCount] = await Promise.all([
+            cleanupBlockConcurrentThrough(range.end),
+            cleanupWaitlistsThrough(range.end),
+        ]);
         console.log(
-            `Deleted ${deletedCount} block_concurrent document(s) dated ${range.end} or earlier.`
+            `Deleted ${deletedBlockCount} block_concurrent document(s) dated ${range.end} or earlier.`
+        );
+        console.log(
+            `Deleted ${deletedWaitlistCount} slot_waitlists document(s) dated ${range.end} or earlier.`
         );
     }
 
@@ -1306,6 +1343,7 @@ module.exports = {
     createPaymentSheet,
     createProductSalesSheet,
     cleanupBlockConcurrentThrough,
+    cleanupWaitlistsThrough,
     getBookingProductAmount,
     splitPayments,
     isRefundedToWallet,

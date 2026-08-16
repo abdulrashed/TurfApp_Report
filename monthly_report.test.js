@@ -6,6 +6,7 @@ const {
     buildMembershipReportRows,
     calculateAnalyticsSummary,
     cleanupBlockConcurrentThrough,
+    cleanupWaitlistsThrough,
     createBookingSheet,
     createMembershipSheet,
     createOnlineBookingSheet,
@@ -15,7 +16,7 @@ const {
     splitPayments,
 } = require("./monthly_report");
 
-const createCleanupFirestore = (pages) => {
+const createCleanupFirestore = (pages, expectedCollection = "block_concurrent") => {
     const cutoffs = [];
     const limits = [];
     const deletedRefs = [];
@@ -23,7 +24,7 @@ const createCleanupFirestore = (pages) => {
 
     const firestore = {
         collection(name) {
-            assert.equal(name, "block_concurrent");
+            assert.equal(name, expectedCollection);
             return {
                 where(field, operator, cutoff) {
                     assert.equal(field, "date");
@@ -117,6 +118,34 @@ test("rejects an invalid block_concurrent cleanup cutoff", async () => {
     await assert.rejects(
         cleanupBlockConcurrentThrough("2026-07-32", {}),
         /Invalid block_concurrent cleanup cutoff/,
+    );
+});
+
+test("deletes slot_waitlists documents through the previous month in safe batches", async () => {
+    const mock = createCleanupFirestore(
+        [
+            ["waitlist-1", "waitlist-2"],
+            ["waitlist-3"],
+            [],
+        ],
+        "slot_waitlists",
+    );
+
+    const deletedCount = await cleanupWaitlistsThrough(
+        "2026-07-31",
+        mock.firestore,
+    );
+
+    assert.equal(deletedCount, 3);
+    assert.deepEqual(mock.deletedRefs, ["waitlist-1", "waitlist-2", "waitlist-3"]);
+    assert.deepEqual(mock.cutoffs, ["2026-07-31", "2026-07-31", "2026-07-31"]);
+    assert.deepEqual(mock.limits, [450, 450, 450]);
+});
+
+test("rejects an invalid slot_waitlists cleanup cutoff", async () => {
+    await assert.rejects(
+        cleanupWaitlistsThrough("2026-07-32", {}),
+        /Invalid slot_waitlists cleanup cutoff/,
     );
 });
 
